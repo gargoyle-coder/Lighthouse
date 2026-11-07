@@ -752,7 +752,7 @@ function updateStepRow(tr,s){
   tr.querySelector('.pill').textContent=s.verified?'Verified':s.done?'Done, unchecked':'Open';
   const act=tr.querySelector('.c-act'),asig=s.done?(s.verified?'v':'d'):'';
   if(act._sig!==asig){act._sig=asig;
-    act.innerHTML=!s.done?'':'<label class="achk" title="'+(s.verified?'Verified by admin. Untick to reopen.':'Tick to verify (admin password required)')+'"><input type="checkbox" aria-label="Admin check" data-check data-sid="'+esc(s.id)+'"'+(s.verified?' checked':'')+'></label>'}
+    act.innerHTML=!s.done?'':'<label class="achk" title="'+(s.verified?'Verified by admin. Untick to reopen.':'Tick to verify (admin password required)')+'"><input type="checkbox" aria-label="Admin check" data-check data-v="'+(s.verified?1:0)+'" data-sid="'+esc(s.id)+'"'+(s.verified?' checked':'')+'></label>'}
   const by=tr.querySelector('.c-by'),sig=s.done?s.by:'';
   if(by._sig!==sig){by._sig=sig;by.innerHTML=s.done?'<span class="who"><span class="av">'+initial(s.by)+'</span>'+esc(s.by)+'</span>':''}
   tr.querySelector('.c-at').textContent=s.done?clock(s.at):'';
@@ -933,7 +933,7 @@ document.addEventListener('click',e=>{
   const c=e.target.closest('[data-check]');
   if(c){
     e.preventDefault();                       // the page re-draws the box once the server confirms
-    const decision=c.checked?'reopen':'verify';
+    const decision=c.dataset.v==='1'?'reopen':'verify';
     if(decision==='reopen'&&ADMIN&&!confirm('Uncheck this step? It will show as not done for everyone and can be ticked again.'))return;
     if(!ADMIN){PENDING={sid:c.dataset.sid,decision};
       if(decision==='reopen'&&!confirm('Uncheck this step? It will show as not done for everyone and can be ticked again.')){PENDING=null;return}
