@@ -1,4 +1,4 @@
-import getpass, hashlib, hmac, math, os, re, sqlite3, sys, threading, time
+import getpass, hashlib, hmac, json, math, os, re, sqlite3, sys, threading, time
 from uuid import uuid4
 import requests
 from PyQt6.QtCore import (Qt, QObject, QPoint, QPointF, QPropertyAnimation, QEasingCurve,
@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget, QHeaderView, QAbstractItemView)
 
-from processes import PROCESSES, STEP_NAMES
+from processes import PROCESSES
 
 BG, PANEL, SIDE = "#f5f2eb", "#fffdf7", "#ece7da"
 INK, MUTED, FAINT, LINE = "#222222", "#6b6657", "#8a8472", "#d9d3c4"
@@ -408,29 +408,135 @@ class Store:
         self.last_sync = None
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS steps(
-                id TEXT PRIMARY KEY, done INTEGER DEFAULT 0, done_by TEXT, done_at REAL);
+                id TEXT PRIMARY KEY, done INTEGER DEFAULT 0, done_by TEXT, done_at REAL,
+                locked INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS outbox(
-                event_id TEXT PRIMARY KEY, step_id TEXT, user TEXT, happened_at REAL);
+                event_id TEXT PRIMARY KEY, step_id TEXT, user TEXT, happened_at REAL,
+                action TEXT DEFAULT 'done');
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
         """)
-        for p in PROCESSES.values():
+        try:  # local databases from before unticking existed
+            self.db.execute("ALTER TABLE outbox ADD COLUMN action TEXT DEFAULT 'done'")
+        except sqlite3.OperationalError:
+            pass
+        try:  # local databases from before admin verification existed
+            self.db.execute("ALTER TABLE steps ADD COLUMN locked INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        # Built-in processes plus any custom ones created on the server dashboard
+        # (cached locally so they are still here after a restart or when offline).
+        self.procs = {pid: {"name": p["name"], "steps": [tuple(x) for x in p["steps"]], "custom": False}
+                      for pid, p in PROCESSES.items()}
+        row = self.db.execute("SELECT value FROM meta WHERE key='custom_procs'").fetchone()
+        if row:
+            try:
+                self._add_custom(json.loads(row[0]))
+            except (ValueError, KeyError, TypeError):
+                pass
+        self._ensure_step_rows()
+        self.db.commit()
+
+    def _add_custom(self, plist):
+        added = []
+        for p in plist:
+            if p["id"] in self.procs:
+                continue
+            self.procs[p["id"]] = {"name": p["name"], "custom": True,
+                                   "steps": [(sid, n) for sid, n in p["steps"]]}
+            added.append(p["id"])
+        return added
+
+    def _ensure_step_rows(self):
+        for p in self.procs.values():
             for sid, _ in p["steps"]:
                 self.db.execute("INSERT OR IGNORE INTO steps(id) VALUES(?)", (sid,))
-        self.db.commit()
+
+    def merge_processes(self, server_procs):
+        """Adopt custom processes reported by the server. Returns the ids that are new."""
+        new = [{"id": p["id"], "name": p["name"], "steps": [[s["id"], s["name"]] for s in p["steps"]]}
+               for p in server_procs if p.get("custom") and p["id"] not in self.procs]
+        if not new:
+            return []
+        with self.lock, self.db:
+            added = self._add_custom(new)
+            self._ensure_step_rows()
+            custom = [{"id": pid, "name": p["name"], "steps": p["steps"]}
+                      for pid, p in self.procs.items() if p["custom"]]
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES('custom_procs',?)", (json.dumps(custom),))
+        return added
+
+    def step_name(self, sid):
+        for p in self.procs.values():
+            for s, n in p["steps"]:
+                if s == sid:
+                    return n
+        return sid
 
     def complete_step(self, step_id):
         now = time.time()
         with self.lock, self.db:
             self.db.execute("UPDATE steps SET done=1, done_by=?, done_at=? WHERE id=? AND done=0",
                             (self.user, now, step_id))
-            self.db.execute("INSERT INTO outbox VALUES(?,?,?,?)",
-                            (str(uuid4()), step_id, self.user, now))
+            self.db.execute("INSERT INTO outbox(event_id,step_id,user,happened_at,action) "
+                            "VALUES(?,?,?,?,'done')", (str(uuid4()), step_id, self.user, now))
         self.wake.set()
+
+    def is_locked(self, step_id):
+        with self.lock:
+            row = self.db.execute("SELECT locked FROM steps WHERE id=?", (step_id,)).fetchone()
+        return bool(row and row[0])
+
+    def uncomplete_step(self, step_id):
+        """Untick a step. Returns False (and does nothing) if an admin has verified it."""
+        now = time.time()
+        with self.lock, self.db:
+            row = self.db.execute("SELECT locked FROM steps WHERE id=?", (step_id,)).fetchone()
+            if row and row[0]:
+                return False
+            self._apply("undo", step_id, None, None)
+            self.db.execute("INSERT INTO outbox(event_id,step_id,user,happened_at,action) "
+                            "VALUES(?,?,?,?,'undo')", (str(uuid4()), step_id, self.user, now))
+        self.wake.set()
+        return True
+
+    def _apply(self, action, step_id, user, at):
+        # caller holds self.lock and a transaction
+        if action == "undo":
+            # a step an admin has verified is locked and cannot be unticked
+            self.db.execute("UPDATE steps SET done=0, done_by=NULL, done_at=NULL "
+                            "WHERE id=? AND locked=0", (step_id,))
+        elif action == "reopen":  # an admin cleared the step (this also removes the lock)
+            self.db.execute("UPDATE steps SET done=0, done_by=NULL, done_at=NULL, locked=0 "
+                            "WHERE id=?", (step_id,))
+        elif action == "done":
+            self.db.execute("UPDATE steps SET done=1, done_by=?, done_at=? WHERE id=? AND done=0",
+                            (user, at, step_id))
+        # 'verify' needs no handling here: the server's list of locked steps covers it
+
+    def _apply_locks(self, locked):
+        # caller holds self.lock and a transaction. The server's list is the truth.
+        ids = {l["step_id"] for l in locked}
+        for (sid,) in self.db.execute("SELECT id FROM steps WHERE locked=1").fetchall():
+            if sid not in ids:
+                self.db.execute("UPDATE steps SET locked=0 WHERE id=?", (sid,))
+        for l in locked:
+            self.db.execute("INSERT OR IGNORE INTO steps(id) VALUES(?)", (l["step_id"],))
+            # also restores the tick if this device unticked it before it learned of the lock
+            self.db.execute("UPDATE steps SET locked=1, done=1, done_by=?, done_at=? WHERE id=?",
+                            (l["by"], l["at"], l["step_id"]))
 
     def step_states(self):
         with self.lock:
-            rows = self.db.execute("SELECT id,done,done_by,done_at FROM steps").fetchall()
-        return {sid: (bool(done), by, at) for sid, done, by, at in rows}
+            rows = self.db.execute("SELECT id,done,done_by,done_at,locked FROM steps").fetchall()
+        return {sid: (bool(done), by, at, bool(lk)) for sid, done, by, at, lk in rows}
+
+    def my_counts(self):
+        """(verified, awaiting check): this account's ticked steps, split by admin verification."""
+        with self.lock:
+            v, w = self.db.execute(
+                "SELECT COALESCE(SUM(locked=1),0), COALESCE(SUM(locked=0),0) FROM steps "
+                "WHERE done=1 AND done_by=?", (self.user,)).fetchone()
+        return int(v), int(w)
 
     def pending(self):
         with self.lock:
@@ -446,11 +552,11 @@ class Store:
             return False
         with self.lock:
             pending = self.db.execute(
-                "SELECT event_id,step_id,user,happened_at FROM outbox").fetchall()
+                "SELECT event_id,step_id,user,happened_at,action FROM outbox ORDER BY rowid").fetchall()
             since = self._since()
         payload = {"device": self.device, "since": since,
-                   "events": [dict(event_id=e, step_id=s, user=u, happened_at=t)
-                              for e, s, u, t in pending]}
+                   "events": [dict(event_id=e, step_id=s, user=u, happened_at=t, action=a or "done")
+                              for e, s, u, t, a in pending]}
         try:
             r = requests.post(self.server, json=payload, timeout=5)
             r.raise_for_status()
@@ -462,9 +568,14 @@ class Store:
             for eid in data["accepted"]:
                 self.db.execute("DELETE FROM outbox WHERE event_id=?", (eid,))
             for ev in data["new_events"]:
-                self.db.execute(
-                    "UPDATE steps SET done=1, done_by=?, done_at=? WHERE id=? AND done=0",
-                    (ev["user"], ev["happened_at"], ev["step_id"]))
+                self.db.execute("INSERT OR IGNORE INTO steps(id) VALUES(?)", (ev["step_id"],))
+                self._apply(ev.get("action", "done"), ev["step_id"], ev["user"], ev["happened_at"])
+            if "locked" in data:
+                self._apply_locks(data["locked"])
+            # changes made on this device while the request was in flight still win locally
+            for sid, u, t, a in self.db.execute(
+                    "SELECT step_id,user,happened_at,action FROM outbox ORDER BY rowid").fetchall():
+                self._apply(a or "done", sid, u, t)
             self.db.execute("INSERT OR REPLACE INTO meta VALUES('since',?)",
                             (str(data["latest_seq"]),))
         self.connected, self.last_sync = True, time.time()
@@ -510,6 +621,11 @@ class CheckBox(QWidget):
         super().__init__()
         self.setFixedSize(24, 24)
         self._p = 0.0
+        self._locked = False
+
+    def set_locked(self, locked):
+        self._locked = locked
+        self.update()
 
     @pyqtProperty(float)
     def progress(self):
@@ -536,11 +652,12 @@ class CheckBox(QWidget):
         p.scale(s, s)
         p.translate(-12, -12)
         r = QRectF(2, 2, 20, 20)
+        tone = OK if self._locked else INK  # green once an admin has verified the step
         p.setBrush(QColor(PANEL))
-        p.setPen(QPen(QColor(INK), 1.4))
+        p.setPen(QPen(QColor(tone), 1.4))
         p.drawRoundedRect(r, 4, 4)
         if t > 0:
-            c = QColor(INK)
+            c = QColor(tone)
             c.setAlphaF(min(1.0, t * 2.2))
             p.setBrush(c)
             p.setPen(Qt.PenStyle.NoPen)
@@ -562,8 +679,32 @@ class CheckBox(QWidget):
             p.drawPolyline(QPolygonF(pts))
 
 
+class LockIcon(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(14, 16)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        col = QColor(OK)
+        pen = QPen(col, 1.8)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        shackle = QPainterPath()
+        shackle.moveTo(3.5, 7.5)
+        shackle.lineTo(3.5, 5.5)
+        shackle.arcTo(QRectF(3.5, 1.5, 7, 8), 180, -180)
+        shackle.lineTo(10.5, 7.5)
+        p.drawPath(shackle)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        p.drawRoundedRect(QRectF(1.5, 7.5, 11, 7.5), 2, 2)
+
+
 class StepRow(QFrame):
-    clicked = pyqtSignal(str, str)
+    clicked = pyqtSignal(str, str, bool)
 
     def __init__(self, idx, sid, name):
         super().__init__()
@@ -587,6 +728,15 @@ class StepRow(QFrame):
         self._lay.addWidget(num)
         self._lay.addWidget(self.box)
         self._lay.addLayout(col, 1)
+        self.locked = False
+        self.badge = QWidget()
+        bl = QHBoxLayout(self.badge)
+        bl.setContentsMargins(0, 0, 4, 0)
+        bl.setSpacing(6)
+        bl.addWidget(LockIcon())
+        bl.addWidget(lab("Verified by admin  ·  locked", 9, True, color=OK))
+        self.badge.hide()
+        self._lay.addWidget(self.badge)
 
     @pyqtProperty(float)
     def hover(self):
@@ -607,14 +757,19 @@ class StepRow(QFrame):
         self._glow = v
         self.update()
 
-    def set_state(self, done, by, at, animate_it=True):
+    def set_state(self, done, by, at, animate_it=True, locked=False):
+        if locked != self.locked:
+            self.locked = locked
+            self.box.set_locked(locked)
+            self.badge.setVisible(locked)
+            self.setToolTip("An admin verified this step, so it is locked and cannot be unticked."
+                            if locked else "")
+            self.setCursor(Qt.CursorShape.ArrowCursor if locked else Qt.CursorShape.PointingHandCursor)
         if done != self.done:
             self.done = done
             self.box.set_done(done, animate_it)
             self.title.setStyleSheet(f"color:{MUTED if done else INK};font-size:12pt;")
             self.meta.setVisible(done)
-            self.setCursor(Qt.CursorShape.ArrowCursor if done
-                           else Qt.CursorShape.PointingHandCursor)
             animate(self, b"hover", 0.0, 150)
             if done and animate_it:
                 animate(self, b"glow", 0.0, 1600, start=1.0)
@@ -636,15 +791,14 @@ class StepRow(QFrame):
         p.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
 
     def enterEvent(self, e):
-        if not self.done:
-            animate(self, b"hover", 1.0, 150)
+        animate(self, b"hover", 1.0, 150)
 
     def leaveEvent(self, e):
         animate(self, b"hover", 0.0, 220)
 
     def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton and not self.done:
-            self.clicked.emit(self.sid, self.name)
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.sid, self.name, self.done)
 
 
 class NavItem(QFrame):
@@ -690,8 +844,9 @@ class NavItem(QFrame):
 
     def set_selected(self, selected, animate_it=True):
         self.selected = selected
-        self.title.setStyleSheet(
-            f"color:{INK};font-size:11pt;font-weight:{'bold' if selected else 'normal'};")
+        # Same weight whether selected or not: bold is wider, so long names would wrap to a
+        # second line that the item is not tall enough for and get clipped.
+        self.title.setStyleSheet(f"color:{INK};font-size:11pt;")
         target = 1.0 if selected else 0.0
         if animate_it:
             animate(self, b"sel", target, 260)
@@ -833,7 +988,7 @@ class MainWindow(QMainWindow):
         self.store = store
         self.have_server_data = False
         self._ready = False
-        self._prev_done, self._prev_conn = {}, None
+        self._prev_done, self._prev_locked, self._prev_conn = {}, {}, None
         self.setWindowTitle(f"Lighthouse - {store.user}")
         self.resize(1160, 740)
         self.setMinimumSize(920, 600)
@@ -853,13 +1008,8 @@ class MainWindow(QMainWindow):
         sync_act.triggered.connect(lambda: store.wake.set())
         m_conn.addAction(self.offline_act)
         m_conn.addAction(sync_act)
-        m_view = self.menuBar().addMenu("View")
-        for i, key in enumerate(list(PROCESSES) + ["dash"], 1):
-            title = PROCESSES[key]["name"] if key in PROCESSES else "Server dashboard"
-            act = QAction(title, self)
-            act.setShortcut(f"Ctrl+{i}")
-            act.triggered.connect(lambda _c=False, k=key: self.select(k))
-            m_view.addAction(act)
+        self.m_view = self.menuBar().addMenu("View")
+        self._build_view_menu()
 
         root = QWidget()
         root.setObjectName("root")
@@ -879,15 +1029,30 @@ class MainWindow(QMainWindow):
         sl.setSpacing(4)
         sl.addWidget(brand_row(22, 32))
         sl.addWidget(lab(f"signed in as {store.user}", 10, italic=True, color=MUTED))
+        self.acct_lbl = lab("", 10, True, color=OK)
+        sl.addWidget(self.acct_lbl)
         sl.addSpacing(18)
         sl.addWidget(section_label("Procedures"))
         sl.addSpacing(4)
         self.items = {}
-        for pid, p in PROCESSES.items():
-            it = NavItem(pid, p["name"], "", len(p["steps"]))
-            it.clicked.connect(self.select)
-            self.items[pid] = it
-            sl.addWidget(it)
+        self.proc_box = QVBoxLayout()
+        self.proc_box.setSpacing(4)
+        self.proc_box.setContentsMargins(0, 0, 0, 0)
+        self.proc_box.addStretch(1)  # keeps items at the top; new ones go in before it
+        host = QWidget()
+        host.setObjectName("prochost")
+        host.setStyleSheet("#prochost{background:transparent;}")
+        host.setLayout(self.proc_box)
+        proc_scroll = QScrollArea()
+        proc_scroll.setWidgetResizable(True)
+        proc_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        proc_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        proc_scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+        proc_scroll.viewport().setStyleSheet("background:transparent;")
+        proc_scroll.setWidget(host)
+        sl.addWidget(proc_scroll, 1)
+        for pid, p in store.procs.items():
+            self._add_nav(pid, p)
         sl.addSpacing(14)
         sl.addWidget(section_label("Overview"))
         sl.addSpacing(4)
@@ -895,14 +1060,14 @@ class MainWindow(QMainWindow):
         dash_item.clicked.connect(self.select)
         self.items["dash"] = dash_item
         sl.addWidget(dash_item)
-        sl.addStretch()
+        sl.addSpacing(10)
         sl.addWidget(section_label("Overall"))
         sl.addSpacing(4)
         self.overall_lbl = lab("", 10, color=MUTED)
         self.overall_bar = QProgressBar()
         self.overall_bar.setTextVisible(False)
         self.overall_bar.setFixedHeight(6)
-        self.overall_bar.setRange(0, sum(len(p["steps"]) for p in PROCESSES.values()))
+        self.overall_bar.setRange(0, sum(len(p["steps"]) for p in store.procs.values()))
         sl.addWidget(self.overall_lbl)
         sl.addWidget(self.overall_bar)
         main.addWidget(side)
@@ -910,9 +1075,8 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         main.addWidget(self.stack, 1)
         self.pages, self.page_index = {}, {}
-        for pid, p in PROCESSES.items():
-            self.page_index[pid] = self.stack.count()
-            self.stack.addWidget(self.build_checklist(pid, p))
+        for pid, p in store.procs.items():
+            self._add_page(pid, p)
         self.page_index["dash"] = self.stack.count()
         self.stack.addWidget(self.build_dashboard())
 
@@ -931,7 +1095,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(bar)
 
         self.toast = Toast(root)
-        self.select(next(iter(PROCESSES)), animate_it=False)
+        self.select(next(iter(store.procs)), animate_it=False)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(1000)
@@ -945,6 +1109,56 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self.toast.reposition()
+
+    def _build_view_menu(self):
+        self.m_view.clear()
+        for i, key in enumerate(list(self.store.procs) + ["dash"], 1):
+            title = self.store.procs[key]["name"] if key in self.store.procs else "Server dashboard"
+            act = QAction(title, self)
+            if i <= 9:
+                act.setShortcut(f"Ctrl+{i}")
+            act.triggered.connect(lambda _c=False, k=key: self.select(k))
+            self.m_view.addAction(act)
+
+    def _add_nav(self, pid, p):
+        it = NavItem(pid, p["name"], "", len(p["steps"]))
+        it.clicked.connect(self.select)
+        self.items[pid] = it
+        self.proc_box.insertWidget(self.proc_box.count() - 1, it)
+
+    def _add_page(self, pid, p):
+        self.page_index[pid] = self.stack.count()
+        self.stack.addWidget(self.build_checklist(pid, p))
+
+    def _add_team_row(self, pid, p):
+        row = QHBoxLayout()
+        row.setSpacing(14)
+        row.setContentsMargins(0, 5, 0, 5)
+        name = lab(p["name"], 11)
+        name.setFixedWidth(280)
+        bar = QProgressBar()
+        bar.setRange(0, len(p["steps"]))
+        bar.setTextVisible(False)
+        bar.setFixedHeight(6)
+        cnt = lab("-", 10, color=MUTED)
+        cnt.setFixedWidth(70)
+        cnt.setAlignment(Qt.AlignmentFlag.AlignRight)
+        row.addWidget(name)
+        row.addWidget(bar, 1)
+        row.addWidget(cnt)
+        self.team_lay.addLayout(row)
+        self.team[pid] = (bar, cnt)
+
+    def _on_new_procs(self, pids):
+        for pid in pids:
+            p = self.store.procs[pid]
+            self._add_nav(pid, p)
+            self._add_page(pid, p)
+            self._add_team_row(pid, p)
+            self.toast.show_msg(f"New process added: {p['name']}", OK)
+        self.overall_bar.setRange(0, sum(len(p["steps"]) for p in self.store.procs.values()))
+        self._build_view_menu()
+        self.refresh()
 
     def build_checklist(self, pid, p):
         page = QWidget()
@@ -969,10 +1183,15 @@ class MainWindow(QMainWindow):
             rows[sid] = row
             lay.addWidget(row)
         lay.addStretch()
-        lay.addWidget(lab("Click a step to mark it done. Completed steps cannot be undone.",
-                          9, italic=True, color=FAINT))
+        lay.addWidget(lab("Click a step to tick or untick it. Every change is recorded in the audit log. "
+                          "Once an admin verifies a step it is locked and cannot be unticked.",
+                          9, italic=True, color=FAINT, wrap=True))
         self.pages[pid] = dict(summary=summary, rows=rows, pct=pct)
-        return page
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(page)
+        return scroll
 
     def build_dashboard(self):
         inner = QWidget()
@@ -1001,24 +1220,12 @@ class MainWindow(QMainWindow):
         lay.addWidget(section_label("Team progress (all devices)"))
         lay.addSpacing(8)
         self.team = {}
-        for pid, p in PROCESSES.items():
-            row = QHBoxLayout()
-            row.setSpacing(14)
-            row.setContentsMargins(0, 5, 0, 5)
-            name = lab(p["name"], 11)
-            name.setFixedWidth(280)
-            bar = QProgressBar()
-            bar.setRange(0, len(p["steps"]))
-            bar.setTextVisible(False)
-            bar.setFixedHeight(6)
-            cnt = lab("-", 10, color=MUTED)
-            cnt.setFixedWidth(70)
-            cnt.setAlignment(Qt.AlignmentFlag.AlignRight)
-            row.addWidget(name)
-            row.addWidget(bar, 1)
-            row.addWidget(cnt)
-            lay.addLayout(row)
-            self.team[pid] = (bar, cnt)
+        self.team_lay = QVBoxLayout()
+        self.team_lay.setSpacing(0)
+        self.team_lay.setContentsMargins(0, 0, 0, 0)
+        lay.addLayout(self.team_lay)
+        for pid, p in self.store.procs.items():
+            self._add_team_row(pid, p)
         lay.addSpacing(26)
 
         lay.addWidget(section_label("Audit log (latest 15 entries)"))
@@ -1069,25 +1276,43 @@ class MainWindow(QMainWindow):
         self.store.wake.set()
         self.refresh()
 
-    def on_step_clicked(self, sid, name):
+    def on_step_clicked(self, sid, name, done):
+        if done and self.store.is_locked(sid):
+            self.toast.show_msg("An admin verified this step. It is locked.", WARN)
+            return
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle("Lighthouse")
-        box.setText("Mark this step as done?")
-        box.setInformativeText(f"{name}\n\nThis cannot be undone.")
+        if done:
+            box.setText("Untick this step?")
+            box.setInformativeText(f"{name}\n\nIt will show as not done for everyone. "
+                                   "The change is recorded in the audit log.")
+        else:
+            box.setText("Mark this step as done?")
+            box.setInformativeText(f"{name}\n\nYou can untick it until an admin verifies it. "
+                                   "After that it is locked.")
         box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         box.setDefaultButton(QMessageBox.StandardButton.No)
         if box.exec() == QMessageBox.StandardButton.Yes:
-            self.store.complete_step(sid)
-            self.refresh()
-            self.toast.show_msg("Step saved on this device", OK)
+            if done:
+                if not self.store.uncomplete_step(sid):
+                    self.refresh()
+                    self.toast.show_msg("An admin verified this step. It is locked.", WARN)
+                    return
+                self._prev_done[sid] = False  # our own change: no "someone unticked" toast
+                self.refresh()
+                self.toast.show_msg("Step unticked on this device", WARN)
+            else:
+                self.store.complete_step(sid)
+                self.refresh()
+                self.toast.show_msg("Step saved on this device", OK)
 
     def refresh(self):
         s = self.store
         states = s.step_states()
         total_done = 0
-        for pid, p in PROCESSES.items():
-            done = sum(states[sid][0] for sid, _ in p["steps"])
+        for pid, p in s.procs.items():
+            done = sum(states.get(sid, (False, None, None, False))[0] for sid, _ in p["steps"])
             total_done += done
             self.items[pid].set_progress(done, len(p["steps"]))
             pg = self.pages[pid]
@@ -1096,11 +1321,18 @@ class MainWindow(QMainWindow):
             pg["pct"].setStyleSheet(
                 f"color:{OK if done == len(p['steps']) else FAINT};font-size:20pt;font-weight:bold;")
             for sid, _ in p["steps"]:
-                d, by, at = states[sid]
-                pg["rows"][sid].set_state(d, by, at, self._ready)
+                d, by, at, lk = states.get(sid, (False, None, None, False))
+                pg["rows"][sid].set_state(d, by, at, self._ready, lk)
+                if self._ready and lk and not self._prev_locked.get(sid) and by == s.user:
+                    self.toast.show_msg(f"An admin verified your step: {s.step_name(sid)}", OK)
+                self._prev_locked[sid] = lk
                 if self._ready and d and not self._prev_done.get(sid) and by != s.user:
-                    self.toast.show_msg(f"{by} completed: {STEP_NAMES[sid]}", OK)
+                    self.toast.show_msg(f"{by} completed: {s.step_name(sid)}", OK)
+                if self._ready and not d and self._prev_done.get(sid):
+                    self.toast.show_msg(f"A step was unticked: {s.step_name(sid)}", WARN)
                 self._prev_done[sid] = d
+        ver, waiting = s.my_counts()
+        self.acct_lbl.setText(f"{ver} verified task{'' if ver == 1 else 's'}  ·  {waiting} awaiting check")
         total = self.overall_bar.maximum()
         self.overall_lbl.setText(f"{total_done} of {total} steps complete")
         set_bar(self.overall_bar, total_done)
@@ -1136,6 +1368,9 @@ class MainWindow(QMainWindow):
             return
         self.have_server_data = True
         self.banner.hide()
+        added = self.store.merge_processes(data["processes"])
+        if added:
+            self._on_new_procs(added)
         self.c_events.set_int(data["total_events"])
         if data["chain_ok"]:
             self.c_chain.set("Intact", OK)
@@ -1145,8 +1380,10 @@ class MainWindow(QMainWindow):
         self.devices_lbl.setText(
             "Devices: " + ", ".join(f"{d['device']} ({d['ago']}s ago)" for d in data["devices"])
             if data["devices"] else "No devices have synced yet.")
-        for pid, proc in zip(PROCESSES, data["processes"]):
-            bar, cnt = self.team[pid]
+        for proc in data["processes"]:
+            if proc["id"] not in self.team:
+                continue
+            bar, cnt = self.team[proc["id"]]
             set_bar(bar, proc["done"])
             cnt.setText(f"{proc['done']} of {proc['total']}")
         log = data["log"]

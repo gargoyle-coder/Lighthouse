@@ -1,5 +1,6 @@
-import hashlib, json, sqlite3, threading, time, uuid
-from fastapi import FastAPI, HTTPException
+import hashlib, hmac, json, os, secrets, sqlite3, threading, time, uuid
+from typing import Literal
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from processes import PROCESSES
@@ -11,9 +12,16 @@ db.execute("""CREATE TABLE IF NOT EXISTS events(
     seq INTEGER PRIMARY KEY AUTOINCREMENT,   -- server order = the sync token
     event_id TEXT UNIQUE,                    -- UNIQUE => idempotency
     device TEXT, step_id TEXT, user TEXT,
-    happened_at REAL, prev_hash TEXT, hash TEXT)""")
+    happened_at REAL, prev_hash TEXT, hash TEXT,
+    action TEXT DEFAULT 'done')""")
+try:  # databases created before unticking existed: old rows count as 'done'
+    db.execute("ALTER TABLE events ADD COLUMN action TEXT DEFAULT 'done'")
+except sqlite3.OperationalError:
+    pass
 db.execute("""CREATE TABLE IF NOT EXISTS custom_processes(
     pid TEXT PRIMARY KEY, name TEXT, steps TEXT, created_at REAL)""")
+db.execute("""CREATE TABLE IF NOT EXISTS admin(
+    id INTEGER PRIMARY KEY CHECK(id=1), salt BLOB, hash BLOB, iters INTEGER)""")
 db.commit()
 
 app = FastAPI()
@@ -24,6 +32,7 @@ class Event(BaseModel):
     step_id: str
     user: str
     happened_at: float
+    action: Literal["done", "undo"] = "done"
 
 
 class SyncRequest(BaseModel):
@@ -37,8 +46,19 @@ class NewProcess(BaseModel):
     steps: list[str]
 
 
-def _hash(eid, sid, user, ts, prev):
-    return hashlib.sha256(json.dumps([eid, sid, user, ts, prev]).encode()).hexdigest()
+class AdminPassword(BaseModel):
+    password: str
+
+
+class Review(BaseModel):
+    step_id: str
+    decision: Literal["verify", "reopen"]
+
+
+def _hash(eid, sid, user, ts, prev, action="done"):
+    # 'done' events hash exactly as before, so chains written by older versions still verify.
+    data = [eid, sid, user, ts, prev] + ([] if action == "done" else [action])
+    return hashlib.sha256(json.dumps(data).encode()).hexdigest()
 
 
 def last_hash():
@@ -48,12 +68,55 @@ def last_hash():
 
 def verify_chain():
     prev = "GENESIS"
-    for seq, eid, sid, user, ts, p, h in db.execute(
-            "SELECT seq,event_id,step_id,user,happened_at,prev_hash,hash FROM events ORDER BY seq"):
-        if p != prev or h != _hash(eid, sid, user, ts, prev):
+    for seq, eid, sid, user, ts, p, h, act in db.execute(
+            "SELECT seq,event_id,step_id,user,happened_at,prev_hash,hash,action "
+            "FROM events ORDER BY seq"):
+        if p != prev or h != _hash(eid, sid, user, ts, prev, act or "done"):
             return False, seq
         prev = h
     return True, None
+
+
+# Admin reviews are written by the server only (never accepted from /sync), into the same
+# hash chain as everything else:
+#   'verify' - an admin confirmed a ticked step is really complete; the step is now locked
+#   'reopen' - an admin cleared a step (rejecting a tick, or reopening a verified step)
+REVIEW_ACTIONS = ("verify", "reopen")
+ADMIN_USER, ADMIN_MIN_LEN, ADMIN_ITERS = "admin", 8, 600_000
+ADMIN_MAX_FAILS, ADMIN_LOCK_SECS, SESSION_SECS = 5, 30, 8 * 3600
+sessions = {}                      # admin token -> expiry time (memory only)
+admin_fails = {"n": 0, "until": 0.0}
+
+
+def insert_event(event_id, device, step_id, user, ts, action):
+    prev = last_hash()
+    db.execute("INSERT INTO events(event_id,device,step_id,user,happened_at,prev_hash,hash,action)"
+               " VALUES(?,?,?,?,?,?,?,?)",
+               (event_id, device, step_id, user, ts, prev,
+                _hash(event_id, step_id, user, ts, prev, action), action))
+
+
+def replay(events):
+    """events: (step_id, user, time, action) in server order.
+    Returns (ticked, verified), each a dict step_id -> (user, time).
+    While a step stays ticked, the first person to tick it keeps the credit. A verified step
+    is locked: only an admin 'reopen' clears it, an 'undo' is ignored."""
+    ticked, verified = {}, {}
+    for sid, user, at, action in events:
+        action = action or "done"
+        if action == "done":
+            ticked.setdefault(sid, (user, at))
+        elif action == "verify":
+            if sid in ticked:
+                verified.setdefault(sid, (user, at))
+        elif action == "reopen" or sid not in verified:   # 'undo' or 'reopen'
+            ticked.pop(sid, None)
+            verified.pop(sid, None)
+    return ticked, verified
+
+
+def replay_db():
+    return replay(db.execute("SELECT step_id,user,happened_at,action FROM events ORDER BY seq"))
 
 
 def all_processes():
@@ -71,17 +134,19 @@ def sync(req: SyncRequest):
         devices[req.device] = time.time()
         for e in req.events:
             if not db.execute("SELECT 1 FROM events WHERE event_id=?", (e.event_id,)).fetchone():
-                prev = last_hash()
-                db.execute("INSERT INTO events(event_id,device,step_id,user,happened_at,prev_hash,hash)"
-                           " VALUES(?,?,?,?,?,?,?)",
-                           (e.event_id, req.device, e.step_id, e.user, e.happened_at, prev,
-                            _hash(e.event_id, e.step_id, e.user, e.happened_at, prev)))
+                # A verified step is locked: an untick is dropped (still 'accepted', so the
+                # client stops resending it, and the 'locked' list below puts it right).
+                if not (e.action == "undo" and e.step_id in replay_db()[1]):
+                    insert_event(e.event_id, req.device, e.step_id, e.user, e.happened_at, e.action)
             accepted.append(e.event_id)
         db.commit()
-        rows = db.execute("SELECT seq,event_id,step_id,user,happened_at FROM events "
+        ticked, verified = replay_db()
+        rows = db.execute("SELECT seq,event_id,step_id,user,happened_at,action FROM events "
                           "WHERE seq>? ORDER BY seq", (req.since,)).fetchall()
     return {"accepted": accepted,
-            "new_events": [dict(seq=r[0], event_id=r[1], step_id=r[2], user=r[3], happened_at=r[4])
+            "locked": [{"step_id": sid, "by": ticked[sid][0], "at": ticked[sid][1]} for sid in verified],
+            "new_events": [dict(seq=r[0], event_id=r[1], step_id=r[2], user=r[3], happened_at=r[4],
+                                action=r[5] or "done")
                            for r in rows],
             "latest_seq": rows[-1][0] if rows else req.since}
 
@@ -114,18 +179,104 @@ def add_process(p: NewProcess):
     return {"id": pid}
 
 
+def admin_hash(pw, salt, iters):
+    return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, iters)
+
+
+def new_session():
+    token = secrets.token_urlsafe(32)
+    with lock:
+        sessions[token] = time.time() + SESSION_SECS
+    return token
+
+
+def require_admin(token):
+    now = time.time()
+    with lock:
+        for t in [t for t, exp in sessions.items() if exp < now]:
+            del sessions[t]
+        ok = token in sessions
+    if not ok:
+        raise HTTPException(401, "Admin sign-in required.")
+
+
+@app.post("/api/admin/setup")
+def admin_setup(b: AdminPassword):
+    """First run only: choose the admin password."""
+    if len(b.password) < ADMIN_MIN_LEN:
+        raise HTTPException(400, f"The password needs at least {ADMIN_MIN_LEN} characters.")
+    salt = os.urandom(16)
+    h = admin_hash(b.password, salt, ADMIN_ITERS)
+    with lock:
+        try:
+            db.execute("INSERT INTO admin(id,salt,hash,iters) VALUES(1,?,?,?)", (salt, h, ADMIN_ITERS))
+            db.commit()
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "An admin password is already set. Sign in instead.")
+    return {"token": new_session()}
+
+
+@app.post("/api/admin/login")
+def admin_login(b: AdminPassword):
+    with lock:
+        wait = admin_fails["until"] - time.time()
+        row = db.execute("SELECT salt,hash,iters FROM admin WHERE id=1").fetchone()
+    if wait > 0:
+        raise HTTPException(429, f"Too many wrong attempts. Try again in {int(wait) + 1} seconds.")
+    if not row:
+        raise HTTPException(409, "No admin password has been set yet.")
+    good = hmac.compare_digest(row[1], admin_hash(b.password, row[0], row[2]))
+    with lock:
+        if good:
+            admin_fails.update(n=0, until=0.0)
+        else:
+            admin_fails["n"] += 1
+            if admin_fails["n"] >= ADMIN_MAX_FAILS:
+                admin_fails.update(n=0, until=time.time() + ADMIN_LOCK_SECS)
+    if not good:
+        raise HTTPException(401, "Wrong password.")
+    return {"token": new_session()}
+
+
+@app.post("/api/admin/logout")
+def admin_logout(x_admin_token: str = Header(default="")):
+    with lock:
+        sessions.pop(x_admin_token, None)
+    return {"ok": True}
+
+
+@app.post("/api/admin/review")
+def admin_review(r: Review, x_admin_token: str = Header(default="")):
+    require_admin(x_admin_token)
+    with lock:
+        if r.step_id not in {sid for p in all_processes().values() for sid, _ in p["steps"]}:
+            raise HTTPException(404, "No such step.")
+        ticked, verified = replay_db()
+        if r.decision == "verify":
+            if r.step_id not in ticked:
+                raise HTTPException(409, "This step is not ticked, so there is nothing to verify.")
+            if r.step_id in verified:
+                raise HTTPException(409, "This step is already verified.")
+        elif r.step_id not in ticked:
+            raise HTTPException(409, "This step is already open.")
+        insert_event(uuid.uuid4().hex, "admin-dashboard", r.step_id, ADMIN_USER, time.time(), r.decision)
+        db.commit()
+    return {"ok": True}
+
+
 @app.get("/api/state")
 def state():
     with lock:
-        rows = db.execute("SELECT seq,step_id,user,device,happened_at,hash FROM events "
+        rows = db.execute("SELECT seq,step_id,user,device,happened_at,hash,action FROM events "
                           "ORDER BY seq").fetchall()
         ok, broken = verify_chain()
         seen = dict(devices)
         procs_def = all_processes()
+        admin_set = db.execute("SELECT 1 FROM admin").fetchone() is not None
     now = time.time()
-    first = {}
-    for r in rows:
-        first.setdefault(r[1], r)
+    # A step is done if its latest event is a tick; an 'undo' clears it. While a step stays
+    # ticked, the first person to tick it keeps the credit. An admin 'verify' locks it.
+    first, verified = replay((r[1], r[2], r[4], r[6]) for r in rows)
 
     step_names = {sid: n for p in procs_def.values() for sid, n in p["steps"]}
     step_proc = {sid: pid for pid, p in procs_def.items() for sid, _ in p["steps"]}
@@ -134,46 +285,55 @@ def state():
     for pid, p in procs_def.items():
         steps = []
         for sid, name in p["steps"]:
-            r = first.get(sid)
-            steps.append({"id": sid, "name": name, "done": bool(r),
-                          "by": r[2] if r else None, "at": r[4] if r else None})
+            t, v = first.get(sid), verified.get(sid)
+            steps.append({"id": sid, "name": name, "done": bool(t),
+                          "by": t[0] if t else None, "at": t[1] if t else None,
+                          "verified": bool(v), "verified_at": v[1] if v else None})
         procs.append({"id": pid, "name": p["name"], "custom": p["custom"], "steps": steps,
-                      "done": sum(s["done"] for s in steps), "total": len(steps)})
+                      "done": sum(s["done"] for s in steps),
+                      "verified": sum(s["verified"] for s in steps), "total": len(steps)})
 
     users = {}
     for r in rows:
-        u = users.setdefault(r[2], {"user": r[2], "events": 0, "steps": 0, "devices": set(),
-                                    "last": 0, "by_proc": {}})
+        if r[6] in REVIEW_ACTIONS:
+            continue   # an admin's review is not anyone's own work
+        u = users.setdefault(r[2], {"user": r[2], "events": 0, "steps": 0, "verified": 0,
+                                    "devices": set(), "last": 0, "by_proc": {}})
         u["events"] += 1
         u["devices"].add(r[3])
         u["last"] = max(u["last"], r[4])
-    for sid, r in first.items():
-        u = users[r[2]]
+    for sid, (who, _at) in first.items():
+        u = users[who]
         u["steps"] += 1
+        if sid in verified:
+            u["verified"] += 1       # credited to whoever ticked it, once an admin has confirmed it
         pid = step_proc.get(sid)
         if pid:
             u["by_proc"][pid] = u["by_proc"].get(pid, 0) + 1
     by_id = {p["id"]: p for p in procs}
     user_list = sorted(
-        ({"user": u["user"], "events": u["events"], "steps": u["steps"],
+        ({"user": u["user"], "events": u["events"], "steps": u["steps"], "verified": u["verified"],
           "last_ago": int(now - u["last"]), "devices": sorted(u["devices"]),
           "processes_touched": len(u["by_proc"]),
           "by_proc": [{"name": by_id[pid]["name"], "done": n, "total": by_id[pid]["total"]}
                       for pid, n in u["by_proc"].items()]}
          for u in users.values()),
-        key=lambda u: (-u["steps"], u["user"].lower()))
+        key=lambda u: (-u["verified"], -u["steps"], u["user"].lower()))
 
     steps_total = sum(p["total"] for p in procs)
     steps_done = sum(p["done"] for p in procs)
-    log = [{"seq": r[0], "step": step_names.get(r[1], r[1]), "user": r[2], "device": r[3],
+    verb = {"undo": "Unticked: ", "verify": "Verified: ", "reopen": "Reopened by admin: "}
+    log = [{"seq": r[0], "step": verb.get(r[6], "") + step_names.get(r[1], r[1]),
+            "user": r[2], "device": r[3],
             "at": r[4], "hash": r[5][:10]} for r in rows[-15:]][::-1]
     return {"processes": procs, "chain_ok": ok, "broken_at": broken, "log": log,
+            "admin_set": admin_set,
             "devices": [{"device": d, "ago": int(now - t)} for d, t in seen.items()],
             "total_events": len(rows), "users": user_list,
             "summary": {"processes": len(procs),
                         "processes_done": sum(p["done"] == p["total"] for p in procs),
-                        "steps_done": steps_done, "steps_total": steps_total,
-                        "users": len(user_list)}}
+                        "steps_done": steps_done, "steps_verified": sum(p["verified"] for p in procs),
+                        "steps_total": steps_total, "users": len(user_list)}}
 
 
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -293,6 +453,34 @@ transform:rotate(45deg) translate(-2px,-2px);transition:transform .4s var(--ease
 .pill{display:inline-block;padding:1px 10px;border-radius:99px;font-size:12px;background:var(--side);color:var(--faint);
 transition:background .4s,color .4s}
 .done .pill{background:#e4f0e6;color:var(--ok);font-weight:bold}
+.done:not(.verified) .pill{background:#fbf0d9;color:var(--warn)}
+.verified .pill{background:var(--ok);color:#fff}
+.col-admin{white-space:nowrap}
+.achk{display:inline-flex;align-items:center;cursor:pointer}
+.achk input{appearance:none;-webkit-appearance:none;width:24px;height:24px;margin:0;cursor:pointer;
+border:2px solid var(--ink);border-radius:5px;background:var(--panel);display:grid;place-items:center;
+transition:background .2s,border-color .2s,transform .15s}
+.achk input:hover{border-color:var(--ok)}
+.achk input:active{transform:scale(.92)}
+.achk input::after{content:"\2713";font-size:16px;font-weight:bold;line-height:1;color:#fff;opacity:0;transform:scale(.5);
+transition:opacity .2s,transform .2s var(--ease)}
+.achk input:checked{background:var(--ok);border-color:var(--ok)}
+.achk input:checked::after{opacity:1;transform:none}
+.abtn{font-size:12px;border:1px solid var(--ink);background:var(--panel);border-radius:4px;padding:2px 10px;
+cursor:pointer;margin-right:6px;transition:background .2s,color .2s}
+.abtn:hover{background:var(--ink);color:var(--bg)}
+.abtn.ok{background:var(--ok);border-color:var(--ok);color:#fff}
+.abtn.ok:hover{background:#2d6336;color:#fff}
+.adminbtn{margin-left:16px;font-size:12px;border:1px solid var(--line);background:var(--panel);border-radius:99px;
+padding:3px 12px;cursor:pointer;transition:border-color .2s,background .2s,color .2s}
+.adminbtn:hover{border-color:var(--ink)}
+body.admin .adminbtn{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+dialog{border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--ink);padding:22px;width:340px}
+dialog::backdrop{background:rgba(34,34,34,.35)}
+dialog h3{margin:0 0 6px;font-size:18px}
+dialog p{margin:0 0 14px;color:var(--muted);font-size:14px}
+dialog input{margin-bottom:8px}
+dialog .btns{display:flex;gap:10px;justify-content:flex-end;margin-top:6px}
 tr.open-step td:first-child{color:var(--muted)}
 .who{display:inline-flex;align-items:center;gap:8px}
 .av{width:22px;height:22px;border-radius:50%;background:var(--ink);color:var(--bg);display:inline-grid;
@@ -301,9 +489,9 @@ place-items:center;font-size:11px;font-weight:bold;flex:none}
 .formgrid{display:grid;grid-template-columns:1fr 340px;gap:22px;align-items:start}
 .panel{padding:20px}
 label.l{display:block;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 6px}
-input[type=text]{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:8px 10px;
+input[type=text],input[type=password]{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:8px 10px;
 transition:border-color .25s,box-shadow .25s,background .25s}
-input[type=text]:focus{outline:none;border-color:var(--ink);background:#fff;box-shadow:0 0 0 3px rgba(34,34,34,.08)}
+input[type=text]:focus,input[type=password]:focus{outline:none;border-color:var(--ink);background:#fff;box-shadow:0 0 0 3px rgba(34,34,34,.08)}
 .srow{display:grid;grid-template-columns:24px 1fr 30px;gap:10px;align-items:center;margin-bottom:8px;
 overflow:hidden;max-height:60px;transition:max-height .25s ease,opacity .25s,margin .25s,transform .25s}
 .srow.leaving{max-height:0;opacity:0;margin-bottom:0;transform:translateX(24px)}
@@ -323,7 +511,7 @@ transition:transform .2s var(--ease),opacity .25s,background .25s,color .25s}
 .preview li{margin-bottom:4px;animation:rise .35s var(--ease) both}
 .preview .none{color:var(--faint);font-style:italic}
 
-.urow{display:grid;grid-template-columns:minmax(150px,1.2fr) 1.4fr 80px 110px;gap:16px;align-items:center;
+.urow{display:grid;grid-template-columns:minmax(150px,1.2fr) 1.4fr 80px 80px 110px;gap:16px;align-items:center;
 padding:14px 18px;border-bottom:1px solid var(--line);transition:background .25s}
 .urow:last-child{border-bottom:none}
 .urow:hover{background:var(--bg)}
@@ -333,7 +521,7 @@ padding:14px 18px;border-bottom:1px solid var(--line);transition:background .25s
 .unum b{font-size:20px}.unum span{color:var(--muted);font-size:12px;display:block}
 .uchips{grid-column:1/-1;margin-top:-4px;padding-left:48px}
 .note{color:var(--muted);font-size:13px;margin-top:14px}
-.hero3{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+.hero3{display:grid;grid-template-columns:repeat(4,1fr);gap:18px}
 
 #toasts{position:fixed;right:22px;bottom:22px;display:flex;flex-direction:column;gap:8px;z-index:50}
 .toast{background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:5px;box-shadow:0 8px 24px rgba(0,0,0,.2);
@@ -346,7 +534,7 @@ animation:toastIn .45s var(--ease) both;transition:opacity .4s,transform .4s}
  nav a{padding:0 9px;font-size:13px}
  .hero,.formgrid,.links,.hero3{grid-template-columns:1fr}
  .phead{grid-template-columns:1fr 70px 46px 14px;gap:10px}
- .urow{grid-template-columns:1fr 70px}.urow .ubar,.urow .ulast{display:none}.uchips{padding-left:0}
+ .urow{grid-template-columns:1fr 64px 64px}.urow .ubar,.urow .ulast{display:none}.uchips{padding-left:0}
  .pin table{font-size:13px}.col-when{display:none}
 }
 @media(prefers-reduced-motion:reduce){
@@ -364,6 +552,7 @@ animation:toastIn .45s var(--ease) both;transition:opacity .4s,transform .4s}
   <span id="ink"></span>
  </nav>
  <div class="live" id="live"><i></i><span>Connecting</span></div>
+ <button class="adminbtn" id="adminbtn" type="button">Admin sign in</button>
 </div></header>
 
 <main class="wrap">
@@ -409,7 +598,7 @@ animation:toastIn .45s var(--ease) both;transition:opacity .4s,transform .4s}
 </section>
 
 <section class="page" id="page-processes">
- <div><h1>Processes</h1><p class="sub">Open a process to see each step, who finished it and when.</p></div>
+ <div><h1>Processes</h1><p class="sub">Open a process to see each step, who finished it and when. Admins can sign in (top right) to verify completed steps; a verified step is locked and cannot be unticked.</p></div>
  <div class="filters" id="filters">
   <button class="fbtn on" data-f="all">All</button>
   <button class="fbtn" data-f="progress">In progress</button>
@@ -444,18 +633,28 @@ animation:toastIn .45s var(--ease) both;transition:opacity .4s,transform .4s}
  <div class="hero3">
   <div class="card tile"><b id="ac-users">0</b><span>users</span></div>
   <div class="card tile"><b id="ac-devs">0</b><span>devices synced since the server started</span></div>
-  <div class="card tile"><b id="ac-steps">0</b><span>steps completed in total</span></div>
+  <div class="card tile"><b id="ac-steps">0</b><span>steps ticked in total</span></div>
+  <div class="card tile"><b id="ac-ver">0</b><span>steps verified by an admin</span></div>
  </div>
  <div>
   <h2>Users</h2>
   <div class="card" id="ulist"></div>
   <div class="empty card" id="uempty" hidden>No one has completed a step yet.</div>
-  <p class="note">Steps are credited to whoever finished them first. Users come from the audit log, because
+  <p class="note">Steps are credited to whoever ticked them; unticked steps are not counted. A step is verified once an admin has confirmed it, and from then on it is locked and counts towards that person's verified total. Users come from the audit log, because
   logins are stored on each client, not on the server.</p>
  </div>
 </section>
 </main>
 <div id="toasts" aria-live="polite"></div>
+<dialog id="adlg">
+ <h3 id="adtitle">Admin sign in</h3>
+ <p id="adsub"></p>
+ <input type="password" id="adpw" placeholder="Password" autocomplete="off">
+ <input type="password" id="adpw2" placeholder="Repeat password" autocomplete="off" hidden>
+ <p class="err" id="aderr" role="alert"></p>
+ <div class="btns"><button class="btn ghost" type="button" id="adcancel">Cancel</button>
+  <button class="btn" type="button" id="adgo">Continue</button></div>
+</dialog>
 
 <script>
 const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
@@ -532,6 +731,7 @@ function renderHome(d){
   num($('#ring-pct'),Math.round(pct*100),v=>v+'%');
   num($('#st-procs'),s.processes_done);$('#st-procs-of').textContent='of '+s.processes+' processes complete';
   num($('#st-steps'),s.steps_done);$('#st-steps-of').textContent='of '+s.steps_total+' steps done';
+  $('#st-steps-of').textContent='of '+s.steps_total+' steps done ('+s.steps_verified+' verified)';
   num($('#st-users'),s.users);num($('#st-events'),d.total_events);
   const c=$('#chain');c.textContent=d.chain_ok?'Intact':'BROKEN at entry '+d.broken_at;c.classList.toggle('bad',!d.chain_ok);
   $('#devs').textContent=d.devices.length?'Devices: '+d.devices.map(v=>v.device+' ('+ago(v.ago)+')').join(', '):'No devices have synced yet.';
@@ -544,12 +744,15 @@ function renderHome(d){
 
 function makeStepRow(s){
   const tr=document.createElement('tr');
-  tr.innerHTML='<td class="c-name"></td><td><span class="pill"></span></td><td class="c-by"></td><td class="col-when c-at"></td>';
+  tr.innerHTML='<td class="c-name"></td><td><span class="pill"></span></td><td class="c-by"></td><td class="col-when c-at"></td><td class="col-admin c-act"></td>';
   tr.querySelector('.c-name').textContent=s.name;return tr;
 }
 function updateStepRow(tr,s){
-  tr.classList.toggle('done',s.done);tr.classList.toggle('open-step',!s.done);
-  tr.querySelector('.pill').textContent=s.done?'Done':'Open';
+  tr.classList.toggle('done',s.done);tr.classList.toggle('open-step',!s.done);tr.classList.toggle('verified',s.verified);
+  tr.querySelector('.pill').textContent=s.verified?'Verified':s.done?'Done, unchecked':'Open';
+  const act=tr.querySelector('.c-act'),asig=s.done?(s.verified?'v':'d'):'';
+  if(act._sig!==asig){act._sig=asig;
+    act.innerHTML=!s.done?'':'<label class="achk" title="'+(s.verified?'Verified by admin. Untick to reopen.':'Tick to verify (admin password required)')+'"><input type="checkbox" aria-label="Admin check" data-check data-sid="'+esc(s.id)+'"'+(s.verified?' checked':'')+'></label>'}
   const by=tr.querySelector('.c-by'),sig=s.done?s.by:'';
   if(by._sig!==sig){by._sig=sig;by.innerHTML=s.done?'<span class="who"><span class="av">'+initial(s.by)+'</span>'+esc(s.by)+'</span>':''}
   tr.querySelector('.c-at').textContent=s.done?clock(s.at):'';
@@ -560,7 +763,7 @@ function makeProc(p){
   const n=document.createElement('article');n.className='card pcard';
   n.innerHTML='<button class="phead" aria-expanded="false"><span class="ptitle"><span class="t"></span><small></small></span>'+
    '<span class="bar"><i></i></span><span class="ppct"></span><span class="chev"></span></button>'+
-   '<div class="pbody"><div class="pin"><table><thead><tr><th>Step</th><th>Status</th><th>Done by</th><th class="col-when">When</th></tr></thead><tbody></tbody></table></div></div>';
+   '<div class="pbody"><div class="pin"><table><thead><tr><th>Step</th><th>Status</th><th>Done by</th><th class="col-when">When</th><th class="col-admin">Admin check</th></tr></thead><tbody></tbody></table></div></div>';
   $('.phead',n).onclick=()=>toggleProc(n);return n;
 }
 function toggleProc(n,force){
@@ -572,7 +775,7 @@ function updateProc(n,p){
   const st=p.done===p.total?'complete':p.done?'progress':'none',pct=Math.round(100*p.done/p.total);
   n.classList.toggle('complete',st==='complete');
   $('.t',n).innerHTML=esc(p.name)+(p.custom?'<span class="tag">Added</span>':'');
-  $('.ptitle small',n).textContent=p.done+' of '+p.total+' steps done';
+  $('.ptitle small',n).textContent=p.done+' of '+p.total+' steps done'+(p.verified?' · '+p.verified+' verified':'');
   setBar($('.bar i',n),pct);num($('.ppct',n),pct,v=>v+'%');
   if(openSet.has(n.dataset.k)&&!n.classList.contains('open'))toggleProc(n,true);
   keyed($('tbody',n),p.steps,s=>s.id,makeStepRow,updateStepRow);
@@ -595,7 +798,7 @@ function makeUser(u){
   const r=document.createElement('div');r.className='urow';
   r.innerHTML='<div class="uname"><span class="av"></span><span><b class="nm"></b><small class="dv"></small></span></div>'+
    '<div class="ubar"><div class="bar"><i></i></div></div>'+
-   '<div class="unum"><b class="ns">0</b><span>steps</span></div>'+
+   '<div class="unum"><b class="ns">0</b><span>steps</span></div>'+'<div class="unum"><b class="nv">0</b><span>verified</span></div>'+
    '<div class="unum ulast"><b class="np">0</b><span class="lt"></span></div><div class="uchips"></div>';
   return r;
 }
@@ -603,14 +806,14 @@ function updateUser(r,u,i,max){
   $('.av',r).textContent=initial(u.user);$('.nm',r).textContent=u.user;
   $('.dv',r).textContent=plural(u.devices.length,'device')+': '+u.devices.join(', ');
   setBar($('.bar i',r),max?Math.round(100*u.steps/max):0);
-  num($('.ns',r),u.steps);
+  num($('.ns',r),u.steps);num($('.nv',r),u.verified);
   num($('.np',r),u.processes_touched);
   $('.lt',r).textContent=(u.processes_touched===1?'process':'processes')+' · '+ago(u.last_ago);
   const sig=JSON.stringify(u.by_proc),ch=$('.uchips',r);
   if(ch._sig!==sig){ch._sig=sig;ch.innerHTML=u.by_proc.map(b=>'<span class="chip">'+esc(b.name)+': '+b.done+'/'+b.total+'</span>').join('')}
 }
 function renderAccounts(d){
-  num($('#ac-users'),d.users.length);num($('#ac-devs'),d.devices.length);num($('#ac-steps'),d.summary.steps_done);
+  num($('#ac-users'),d.users.length);num($('#ac-devs'),d.devices.length);num($('#ac-steps'),d.summary.steps_done);num($('#ac-ver'),d.summary.steps_verified);
   const max=Math.max(0,...d.users.map(u=>u.steps));
   $('#uempty').hidden=d.users.length>0;$('#ulist').hidden=d.users.length===0;
   keyed($('#ulist'),d.users,u=>u.user,makeUser,(r,u,i)=>updateUser(r,u,i,max));
@@ -674,6 +877,76 @@ $('#save').onclick=async()=>{
   finally{btn.disabled=false;btn.textContent='Create process'}
 };
 
+
+let ADMIN='';try{ADMIN=sessionStorage.getItem('lh_admin')||''}catch(e){}
+function setAdmin(t){
+  ADMIN=t;try{t?sessionStorage.setItem('lh_admin',t):sessionStorage.removeItem('lh_admin')}catch(e){}
+  document.body.classList.toggle('admin',!!t);
+  $('#adminbtn').textContent=t?'Admin: sign out':'Admin sign in';
+}
+const adlg=$('#adlg');
+let PENDING=null;
+$('#adminbtn').onclick=async()=>{
+  if(ADMIN){try{await fetch('/api/admin/logout',{method:'POST',headers:{'X-Admin-Token':ADMIN}})}catch(e){}
+    setAdmin('');toast('Signed out of admin');return}
+  openAdminDialog();
+};
+function openAdminDialog(){
+  if(!DATA){toast('Cannot reach the server.');return}
+  const setup=!DATA.admin_set;
+  $('#adtitle').textContent=setup?'Create admin password':'Admin sign in';
+  $('#adsub').textContent=setup?'No admin password exists yet. Choose one (at least 8 characters). Admins verify that steps are really complete.'
+    :'Enter the admin password to verify completed steps.';
+  $('#adpw2').hidden=!setup;$('#adpw').value=$('#adpw2').value='';$('#aderr').textContent='';
+  adlg.showModal();$('#adpw').focus();
+}
+$('#adcancel').onclick=()=>{PENDING=null;adlg.close()};
+adlg.addEventListener('cancel',()=>{PENDING=null});
+async function adminGo(){
+  const setup=!DATA.admin_set,pw=$('#adpw').value,err=$('#aderr'),btn=$('#adgo');err.textContent='';
+  if(setup){
+    if(pw.length<8){err.textContent='The password needs at least 8 characters.';return}
+    if(pw!==$('#adpw2').value){err.textContent='The two passwords do not match.';return}
+  }else if(!pw){err.textContent='Enter the password.';return}
+  btn.disabled=true;
+  try{
+    const r=await fetch(setup?'/api/admin/setup':'/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(typeof j.detail==='string'?j.detail:'Could not sign in.');
+    setAdmin(j.token);adlg.close();toast(setup?'Admin password set. You are signed in.':'Signed in as admin');
+    const p=PENDING;PENDING=null;if(p)review(p.sid,p.decision);else load();
+  }catch(e){err.textContent=e.message||'Could not reach the server.';$('#adpw').value=$('#adpw2').value=''}
+  finally{btn.disabled=false}
+}
+$('#adgo').onclick=adminGo;
+for(const id of ['#adpw','#adpw2'])$(id).addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();adminGo()}});
+async function review(sid,decision){
+  try{
+    const r=await fetch('/api/admin/review',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Token':ADMIN},body:JSON.stringify({step_id:sid,decision})});
+    if(r.status===401){setAdmin('');toast('Admin session expired. Sign in again.');return}
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(typeof j.detail==='string'?j.detail:'Could not save that.');
+    toast(decision==='verify'?'Verified. The step is now locked.':'Step reopened');await load();
+  }catch(e){toast(e.message||'Could not reach the server.')}
+}
+document.addEventListener('click',e=>{
+  const c=e.target.closest('[data-check]');
+  if(c){
+    e.preventDefault();                       // the page re-draws the box once the server confirms
+    const decision=c.checked?'reopen':'verify';
+    if(decision==='reopen'&&ADMIN&&!confirm('Uncheck this step? It will show as not done for everyone and can be ticked again.'))return;
+    if(!ADMIN){PENDING={sid:c.dataset.sid,decision};
+      if(decision==='reopen'&&!confirm('Uncheck this step? It will show as not done for everyone and can be ticked again.')){PENDING=null;return}
+      openAdminDialog();return}
+    review(c.dataset.sid,decision);return;
+  }
+  const b=e.target.closest('[data-review]');if(!b)return;
+  const d=b.dataset.review;
+  if(d==='reopen'&&!confirm('Clear this step? It will show as not done for everyone and can be ticked again.'))return;
+  if(!ADMIN){PENDING={sid:b.dataset.sid,decision:d};openAdminDialog();return}
+  review(b.dataset.sid,d);
+});
+setAdmin(ADMIN);
 resetForm();route();
 requestAnimationFrame(()=>requestAnimationFrame(()=>$('#nav').classList.add('ready')));
 load();setInterval(()=>{if(!document.hidden)load()},2000);
